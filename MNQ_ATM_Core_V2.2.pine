@@ -1,0 +1,579 @@
+//@version=6
+strategy("MNQ ATM Core V2.2 — Fill-Parity Structural Retest (Research)", overlay = true, pyramiding = 0, process_orders_on_close = false, calc_on_order_fills = true, max_labels_count = 200)
+
+// This is the TradingView version of ATM Core V2.  It is deliberately a
+// strategy (not an auto-trader) and is designed only for a 1-minute MNQ chart.
+// Every BOS / CHoCH is confirmed at bar close; a limit order becomes active
+// only after that confirmation. Fixed brackets are recalculated after a fill
+// from strategy.position_avg_price, so they measure exactly -20 / +50 points
+// from the broker emulator's actual fill price.
+
+const string TZ = "Asia/Taipei"
+const string RANGE_SESSION = "0600-0700:1234567"
+const string MORNING_SESSION = "0600-1200:1234567"
+const string LONG_ID = "ATM V2 Long"
+const string SHORT_ID = "ATM V2 Short"
+const string LONG_EXIT_ID = "ATM V2 Long Exit"
+const string SHORT_EXIT_ID = "ATM V2 Short Exit"
+const float FIXED_STOP_POINTS = 20.0
+const float FIXED_TARGET_POINTS = 50.0
+
+int pendingMinutes = input.int(60, "掛單有效分鐘", minval = 1, maxval = 240, group = "進場")
+int maxEntriesPerDay = input.int(0, "每日最多進場（0 = 不限）", minval = 0, maxval = 20, group = "進場")
+bool cancelOnOppositeTouch = input.bool(true, "先碰對側亞洲線就取消舊掛單", group = "進場")
+bool closeAtNoon = input.bool(true, "12:00 平倉並取消掛單", group = "進場")
+
+// Fixed-test lock: these values are constants, not TV inputs. This prevents a
+// chart from silently retaining an earlier 25-point setting after a script update.
+float stopBuffer = input.float(0.25, "結構止損緩衝點（此固定版本不使用）", minval = 0.0, step = 0.25, group = "風險")
+float minRisk = input.float(8.0, "最小初始風險（此固定版本不使用）", minval = 0.25, step = 0.25, group = "風險")
+float maxRisk = input.float(60.0, "最大初始風險（此固定版本不使用）", minval = 1.0, step = 0.25, group = "風險")
+float continuationRR = input.float(4.0, "延續單止盈（此固定版本不使用）", minval = 1.0, step = 0.25, group = "風險")
+
+bool enableRearm = input.bool(true, "啟用結構重新武裝", group = "重新武裝")
+int maxRearmsPerSide = input.int(1, "每條亞洲線最多重新武裝次數", minval = 0, maxval = 3, group = "重新武裝")
+
+bool showFilledEntries = input.bool(true, "顯示 BUY／SELL 成交", group = "顯示")
+bool showPending = input.bool(true, "顯示未成交掛單", group = "顯示")
+bool showRisk = input.bool(true, "顯示持倉止損／止盈", group = "顯示")
+bool showResearchSteps = input.bool(false, "顯示 BOS／CHoCH 研究標記", group = "顯示")
+color highColour = input.color(color.lime, "亞洲高顏色", group = "顯示")
+color lowColour = input.color(color.red, "亞洲低顏色", group = "顯示")
+color longColour = input.color(color.aqua, "多單顏色", group = "顯示")
+color shortColour = input.color(color.orange, "空單顏色", group = "顯示")
+
+inRange = not na(time(timeframe.period, RANGE_SESSION, TZ))
+inMorning = not na(time(timeframe.period, MORNING_SESSION, TZ))
+newRange = inRange and not inRange[1]
+morningJustEnded = not inMorning and inMorning[1]
+useFixedRisk = false
+
+// Historical-candle ordering used only for pending-order invalidation.
+// It prevents a pending order from surviving when the opposite Asia boundary
+// was touched first within the same completed bar.
+f_up_touch_progress(float level) =>
+    bool highFirst = math.abs(open - high) < math.abs(open - low)
+    float p0 = open
+    float p1 = highFirst ? high : low
+    float p2 = highFirst ? low : high
+    float p3 = close
+    float result = na
+    if p0 >= level
+        result := 0.0
+    else if p1 > p0 and p0 < level and level <= p1
+        result := (level - p0) / (p1 - p0)
+    else if p2 > p1 and p1 < level and level <= p2
+        result := 1.0 + (level - p1) / (p2 - p1)
+    else if p3 > p2 and p2 < level and level <= p3
+        result := 2.0 + (level - p2) / (p3 - p2)
+    result
+
+f_down_touch_progress(float level) =>
+    bool highFirst = math.abs(open - high) < math.abs(open - low)
+    float p0 = open
+    float p1 = highFirst ? high : low
+    float p2 = highFirst ? low : high
+    float p3 = close
+    float result = na
+    if p0 <= level
+        result := 0.0
+    else if p1 < p0 and p0 > level and level >= p1
+        result := (p0 - level) / (p0 - p1)
+    else if p2 < p1 and p1 > level and level >= p2
+        result := 1.0 + (p1 - level) / (p1 - p2)
+    else if p3 < p2 and p2 > level and level >= p3
+        result := 2.0 + (p2 - level) / (p2 - p3)
+    result
+
+f_cancel_pending(int direction) =>
+    if direction == 1
+        strategy.cancel(LONG_ID)
+        strategy.cancel(LONG_EXIT_ID)
+    else if direction == -1
+        strategy.cancel(SHORT_ID)
+        strategy.cancel(SHORT_EXIT_ID)
+
+// Python Core V2 uses the closest valid 1m FVG/OB boundary as additional
+// continuation-stop context. It is not an entry filter.
+f_long_continuation_guard(float entry) =>
+    float guard = na
+    if bar_index >= 2 and low > high[2]
+        guard := high[2]
+    else
+        for offset = 1 to 5
+            if close[offset] < open[offset]
+                guard := low[offset]
+                break
+    not na(guard) and guard < entry ? guard : na
+
+f_short_continuation_guard(float entry) =>
+    float guard = na
+    if bar_index >= 2 and high < low[2]
+        guard := low[2]
+    else
+        for offset = 1 to 5
+            if close[offset] > open[offset]
+                guard := high[offset]
+                break
+    not na(guard) and guard > entry ? guard : na
+
+// Asia range and confirmed market-structure state.
+var float asiaHigh = na
+var float asiaLow = na
+var int morningBars = 0
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var bool highTouched = false
+var bool lowTouched = false
+var int highTouchBar = na
+var int lowTouchBar = na
+var float highSweepExtreme = na
+var float lowSweepExtreme = na
+var int highReclaimPhase = 0
+var int lowReclaimPhase = 0
+var float highBreakoutExtreme = na
+var float lowBreakoutExtreme = na
+var bool highResolved = false
+var bool lowResolved = false
+var int highResolutionDirection = 0
+var int lowResolutionDirection = 0
+var int highResolutionBar = na
+var int lowResolutionBar = na
+var bool highRearmReady = false
+var bool lowRearmReady = false
+var int highRearmReadyBar = na
+var int lowRearmReadyBar = na
+var int highRearmsUsed = 0
+var int lowRearmsUsed = 0
+var int entriesToday = 0
+
+// Pending limit order state.  The stop and target are frozen at the signal
+// close, before the order can fill, so the script does not use future bars.
+var int pendingDirection = 0
+var float pendingPrice = na
+var float pendingStop = na
+var float pendingTarget = na
+var float pendingRisk = na
+var bool pendingIsReversal = false
+var int pendingExpiresAt = na
+var int pendingSignalBar = na
+var int pendingOriginSide = 0
+
+// Position state, including the Core V2 reversal structure trail.
+var float activeStop = na
+var float activeTarget = na
+var float activeInitialRisk = na
+var bool activeIsReversal = false
+var int activeEntryBar = na
+var bool activeOneRReached = false
+var int activeOneRBar = na
+var bool activeBosAfterOneR = false
+var int noNewSetupUntilBar = na
+
+if newRange
+    f_cancel_pending(pendingDirection)
+    asiaHigh := high
+    asiaLow := low
+    morningBars := 1
+    lastSwingHigh := na
+    lastSwingLow := na
+    highTouched := false
+    lowTouched := false
+    highTouchBar := na
+    lowTouchBar := na
+    highSweepExtreme := na
+    lowSweepExtreme := na
+    highReclaimPhase := 0
+    lowReclaimPhase := 0
+    highBreakoutExtreme := na
+    lowBreakoutExtreme := na
+    highResolved := false
+    lowResolved := false
+    highResolutionDirection := 0
+    lowResolutionDirection := 0
+    highResolutionBar := na
+    lowResolutionBar := na
+    highRearmReady := false
+    lowRearmReady := false
+    highRearmReadyBar := na
+    lowRearmReadyBar := na
+    highRearmsUsed := 0
+    lowRearmsUsed := 0
+    entriesToday := 0
+    pendingDirection := 0
+    pendingPrice := na
+    pendingStop := na
+    pendingTarget := na
+    pendingRisk := na
+    pendingIsReversal := false
+    pendingExpiresAt := na
+    pendingSignalBar := na
+    pendingOriginSide := 0
+    activeStop := na
+    activeTarget := na
+    activeInitialRisk := na
+    activeIsReversal := false
+    activeEntryBar := na
+    activeOneRReached := false
+    activeOneRBar := na
+    activeBosAfterOneR := false
+    noNewSetupUntilBar := na
+else if inRange
+    asiaHigh := math.max(asiaHigh, high)
+    asiaLow := math.min(asiaLow, low)
+    morningBars += 1
+else if inMorning
+    morningBars += 1
+
+if closeAtNoon and morningJustEnded
+    f_cancel_pending(pendingDirection)
+    pendingDirection := 0
+    pendingOriginSide := 0
+    strategy.close_all(comment = "12:00 Taipei close")
+
+// A 2-left / 2-right pivot is known only after two further bars close.
+bool pivotHighConfirmed = false
+bool pivotLowConfirmed = false
+float confirmedPivotHigh = na
+float confirmedPivotLow = na
+if inMorning and morningBars >= 5 and bar_index >= 4
+    pivotHighConfirmed := high[2] > high[4] and high[2] > high[3] and high[2] >= high[1] and high[2] >= high
+    pivotLowConfirmed := low[2] < low[4] and low[2] < low[3] and low[2] <= low[1] and low[2] <= low
+    if pivotHighConfirmed
+        confirmedPivotHigh := high[2]
+        lastSwingHigh := confirmedPivotHigh
+    if pivotLowConfirmed
+        confirmedPivotLow := low[2]
+        lastSwingLow := confirmedPivotLow
+
+bool canAssess = barstate.isconfirmed and inMorning and not inRange and not na(asiaHigh) and not na(asiaLow) and not na(close[1])
+bool highTouchNew = false
+bool lowTouchNew = false
+bool highBosSignal = false
+bool lowBosSignal = false
+bool highChochSignal = false
+bool lowChochSignal = false
+bool highRearmBos = false
+bool lowRearmBos = false
+bool highRearmed = false
+bool lowRearmed = false
+
+// A fill is reported on the next script calculation.  At that point, transfer
+// the signal-close bracket to the live position state.
+bool newPosition = strategy.position_size != 0 and strategy.position_size[1] == 0
+bool newLongPosition = newPosition and strategy.position_size > 0
+bool newShortPosition = newPosition and strategy.position_size < 0
+if newPosition
+    entriesToday += 1
+    if useFixedRisk
+        activeStop := strategy.position_size > 0 ? strategy.position_avg_price - FIXED_STOP_POINTS : strategy.position_avg_price + FIXED_STOP_POINTS
+        activeTarget := strategy.position_size > 0 ? strategy.position_avg_price + FIXED_TARGET_POINTS : strategy.position_avg_price - FIXED_TARGET_POINTS
+    else
+        // The structural stop is known at signal close, but the continuation
+        // target and 1R trigger must use the simulated limit-fill price.
+        float actualRisk = math.abs(strategy.position_avg_price - pendingStop)
+        activeStop := pendingStop
+        activeTarget := pendingIsReversal ? pendingTarget : strategy.position_size > 0 ? strategy.position_avg_price + actualRisk * continuationRR : strategy.position_avg_price - actualRisk * continuationRR
+        activeInitialRisk := actualRisk
+    if useFixedRisk
+        activeInitialRisk := FIXED_STOP_POINTS
+    activeIsReversal := pendingIsReversal
+    activeEntryBar := bar_index
+    activeOneRReached := false
+    activeOneRBar := na
+    activeBosAfterOneR := false
+    pendingDirection := 0
+    pendingPrice := na
+    pendingStop := na
+    pendingTarget := na
+    pendingRisk := na
+    pendingIsReversal := false
+    pendingExpiresAt := na
+    pendingSignalBar := na
+    pendingOriginSide := 0
+
+bool positionClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if positionClosed
+    activeStop := na
+    activeTarget := na
+    activeInitialRisk := na
+    activeIsReversal := false
+    activeEntryBar := na
+    activeOneRReached := false
+    activeOneRBar := na
+    activeBosAfterOneR := false
+    noNewSetupUntilBar := bar_index
+
+// Core V2 reversal trail: only after 1R, then a later closed BOS, then a
+// confirmed post-entry pullback pivot.  The modified stop is effective on the
+// next bar, never inside the bar that confirmed the pivot.
+if canAssess and strategy.position_size != 0 and activeIsReversal and not useFixedRisk and not na(activeInitialRisk)
+    if not activeOneRReached
+        bool reachedOneR = strategy.position_size > 0 ? high >= strategy.position_avg_price + activeInitialRisk : low <= strategy.position_avg_price - activeInitialRisk
+        if reachedOneR
+            activeOneRReached := true
+            activeOneRBar := bar_index
+    if activeOneRReached and not activeBosAfterOneR and bar_index > activeOneRBar
+        bool directionalBos = strategy.position_size > 0 ? (not na(lastSwingHigh) and close[1] <= lastSwingHigh and close > lastSwingHigh) : (not na(lastSwingLow) and close[1] >= lastSwingLow and close < lastSwingLow)
+        if directionalBos
+            activeBosAfterOneR := true
+    if activeBosAfterOneR and not na(activeEntryBar) and bar_index - 2 > activeEntryBar
+        if strategy.position_size > 0 and pivotLowConfirmed
+            float candidateStop = math.round_to_mintick(confirmedPivotLow - stopBuffer)
+            if candidateStop > activeStop and candidateStop < close
+                activeStop := candidateStop
+        if strategy.position_size < 0 and pivotHighConfirmed
+            float candidateStop = math.round_to_mintick(confirmedPivotHigh + stopBuffer)
+            if candidateStop < activeStop and candidateStop > close
+                activeStop := candidateStop
+
+if strategy.position_size > 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit(LONG_EXIT_ID, from_entry = LONG_ID, stop = activeStop, limit = activeTarget)
+else if strategy.position_size < 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit(SHORT_EXIT_ID, from_entry = SHORT_ID, stop = activeStop, limit = activeTarget)
+
+// A limit can fill intrabar while historical Pine still reports position size
+// as flat until the next calculation.  When that happens, do not let a fresh
+// close-confirmed structure cancel or replace the already pre-armed bracket.
+// This is particularly important for the fixed 20-point stop / 50-point
+// target mode, where a non-noon exit should otherwise be exactly -20 or +50.
+bool pendingExpectedFillThisBar = false
+if canAssess and pendingDirection != 0 and strategy.position_size == 0 and bar_index > pendingSignalBar
+    bool stillWithinTime = time < pendingExpiresAt
+    bool stillWithinCount = maxEntriesPerDay == 0 or entriesToday < maxEntriesPerDay
+    float expectedEntryProgress = pendingDirection == 1 ? f_down_touch_progress(pendingPrice) : f_up_touch_progress(pendingPrice)
+    float expectedOppositeProgress = pendingOriginSide == 1 ? f_down_touch_progress(asiaLow) : f_up_touch_progress(asiaHigh)
+    bool oppositeWins = cancelOnOppositeTouch and not na(expectedOppositeProgress) and (na(expectedEntryProgress) or expectedOppositeProgress <= expectedEntryProgress)
+    pendingExpectedFillThisBar := stillWithinTime and stillWithinCount and not oppositeWins and not na(expectedEntryProgress)
+
+// Cancel stale pending orders before evaluating fresh close-confirmed setups.
+if canAssess and pendingDirection != 0 and strategy.position_size == 0
+    bool cancelForTime = time >= pendingExpiresAt
+    bool cancelForCount = maxEntriesPerDay > 0 and entriesToday >= maxEntriesPerDay
+    bool cancelForOpposite = false
+    if not cancelForTime and not cancelForCount and bar_index > pendingSignalBar and cancelOnOppositeTouch
+        float entryProgress = pendingDirection == 1 ? f_down_touch_progress(pendingPrice) : f_up_touch_progress(pendingPrice)
+        float oppositeProgress = pendingOriginSide == 1 ? f_down_touch_progress(asiaLow) : f_up_touch_progress(asiaHigh)
+        cancelForOpposite := not na(oppositeProgress) and (na(entryProgress) or oppositeProgress <= entryProgress)
+    if cancelForTime or cancelForCount or cancelForOpposite
+        f_cancel_pending(pendingDirection)
+        pendingDirection := 0
+        pendingPrice := na
+        pendingStop := na
+        pendingTarget := na
+        pendingRisk := na
+        pendingIsReversal := false
+        pendingExpiresAt := na
+        pendingSignalBar := na
+        pendingOriginSide := 0
+
+bool setupFound = false
+int setupCode = 0
+
+if canAssess and strategy.position_size == 0 and not pendingExpectedFillThisBar and (na(noNewSetupUntilBar) or bar_index > noNewSetupUntilBar) and (maxEntriesPerDay == 0 or entriesToday < maxEntriesPerDay)
+    float previousClose = close[1]
+
+    // Re-arm only after the prior direction extends with a later BOS and a
+    // subsequent physical retest of that exact Asia boundary.
+    if enableRearm and pendingDirection == 0
+        bool highPostResolutionBos = false
+        bool lowPostResolutionBos = false
+        bool highDirectionalRetest = false
+        bool lowDirectionalRetest = false
+        if highResolutionDirection == 1
+            highPostResolutionBos := not na(lastSwingHigh) and previousClose <= lastSwingHigh and close > lastSwingHigh
+            highDirectionalRetest := previousClose > asiaHigh and low <= asiaHigh
+        else if highResolutionDirection == -1
+            highPostResolutionBos := not na(lastSwingLow) and previousClose >= lastSwingLow and close < lastSwingLow
+            highDirectionalRetest := previousClose < asiaHigh and high >= asiaHigh
+        if lowResolutionDirection == 1
+            lowPostResolutionBos := not na(lastSwingHigh) and previousClose <= lastSwingHigh and close > lastSwingHigh
+            lowDirectionalRetest := previousClose > asiaLow and low <= asiaLow
+        else if lowResolutionDirection == -1
+            lowPostResolutionBos := not na(lastSwingLow) and previousClose >= lastSwingLow and close < lastSwingLow
+            lowDirectionalRetest := previousClose < asiaLow and high >= asiaLow
+        if highResolved and not highRearmReady and highRearmsUsed < maxRearmsPerSide and bar_index > highResolutionBar and highPostResolutionBos
+            highRearmReady := true
+            highRearmReadyBar := bar_index
+            highRearmBos := true
+        if lowResolved and not lowRearmReady and lowRearmsUsed < maxRearmsPerSide and bar_index > lowResolutionBar and lowPostResolutionBos
+            lowRearmReady := true
+            lowRearmReadyBar := bar_index
+            lowRearmBos := true
+        if highRearmReady and bar_index > highRearmReadyBar and highDirectionalRetest
+            highTouched := false
+            highResolved := false
+            highResolutionDirection := 0
+            highResolutionBar := na
+            highTouchBar := na
+            highSweepExtreme := na
+            highReclaimPhase := 0
+            highBreakoutExtreme := na
+            highRearmReady := false
+            highRearmReadyBar := na
+            highRearmsUsed += 1
+            highRearmed := true
+        if lowRearmReady and bar_index > lowRearmReadyBar and lowDirectionalRetest
+            lowTouched := false
+            lowResolved := false
+            lowResolutionDirection := 0
+            lowResolutionBar := na
+            lowTouchBar := na
+            lowSweepExtreme := na
+            lowReclaimPhase := 0
+            lowBreakoutExtreme := na
+            lowRearmReady := false
+            lowRearmReadyBar := na
+            lowRearmsUsed += 1
+            lowRearmed := true
+
+    if not highTouched and high >= asiaHigh
+        highTouched := true
+        highTouchBar := bar_index
+        highSweepExtreme := high
+        highTouchNew := true
+    if not lowTouched and low <= asiaLow
+        lowTouched := true
+        lowTouchBar := bar_index
+        lowSweepExtreme := low
+        lowTouchNew := true
+    if highTouched
+        highSweepExtreme := math.max(nz(highSweepExtreme, high), high)
+    if lowTouched
+        lowSweepExtreme := math.min(nz(lowSweepExtreme, low), low)
+
+    // High continuation: break outside -> close inside -> reclaim -> later BOS.
+    if highReclaimPhase == 0 and previousClose <= asiaHigh and close > asiaHigh
+        highReclaimPhase := 1
+        highBreakoutExtreme := high
+    else if highReclaimPhase == 1
+        if close > asiaHigh
+            highBreakoutExtreme := math.max(highBreakoutExtreme, high)
+        else
+            highReclaimPhase := 2
+    else if highReclaimPhase == 2 and close > asiaHigh
+        highReclaimPhase := 3
+    else if highReclaimPhase == 3 and close <= asiaHigh
+        highReclaimPhase := 2
+
+    // Low continuation is the exact mirror.
+    if lowReclaimPhase == 0 and previousClose >= asiaLow and close < asiaLow
+        lowReclaimPhase := 1
+        lowBreakoutExtreme := low
+    else if lowReclaimPhase == 1
+        if close < asiaLow
+            lowBreakoutExtreme := math.min(lowBreakoutExtreme, low)
+        else
+            lowReclaimPhase := 2
+    else if lowReclaimPhase == 2 and close < asiaLow
+        lowReclaimPhase := 3
+    else if lowReclaimPhase == 3 and close >= asiaLow
+        lowReclaimPhase := 2
+
+    // Four paths.  High has priority if both sides confirm on one candle,
+    // matching the local research runner's deterministic tie-break.
+    if highTouched and not highResolved and bar_index > highTouchBar
+        if highReclaimPhase == 3 and not na(highBreakoutExtreme) and previousClose <= highBreakoutExtreme and close > highBreakoutExtreme
+            setupFound := true
+            setupCode := 1  // High continuation long
+            highBosSignal := true
+        else if not na(lastSwingLow) and previousClose >= lastSwingLow and close < lastSwingLow
+            setupFound := true
+            setupCode := 2  // High reversal short
+            highChochSignal := true
+        if setupFound
+            highResolved := true
+            highResolutionDirection := setupCode == 1 ? 1 : -1
+            highResolutionBar := bar_index
+
+    if not setupFound and lowTouched and not lowResolved and bar_index > lowTouchBar
+        if lowReclaimPhase == 3 and not na(lowBreakoutExtreme) and previousClose >= lowBreakoutExtreme and close < lowBreakoutExtreme
+            setupFound := true
+            setupCode := 3  // Low continuation short
+            lowBosSignal := true
+        else if not na(lastSwingHigh) and previousClose <= lastSwingHigh and close > lastSwingHigh
+            setupFound := true
+            setupCode := 4  // Low reversal long
+            lowChochSignal := true
+        if setupFound
+            lowResolved := true
+            lowResolutionDirection := setupCode == 4 ? 1 : -1
+            lowResolutionBar := bar_index
+
+// Submit a new limit only after its confirmation candle has closed.  A new
+// confirmed structure replaces any older unfilled pending order.
+if setupFound
+    int direction = setupCode == 1 or setupCode == 4 ? 1 : -1
+    bool isReversal = setupCode == 2 or setupCode == 4
+    float anchor = setupCode == 1 or setupCode == 2 ? asiaHigh : asiaLow
+    float rawStop = na
+    if useFixedRisk
+        rawStop := direction == 1 ? anchor - FIXED_STOP_POINTS : anchor + FIXED_STOP_POINTS
+    else if setupCode == 1
+        float guard = f_long_continuation_guard(anchor)
+        float stopBase = lastSwingLow
+        if not na(guard) and (na(stopBase) or guard > stopBase)
+            stopBase := guard
+        rawStop := stopBase - stopBuffer
+    else if setupCode == 2
+        rawStop := highSweepExtreme + stopBuffer
+    else if setupCode == 3
+        float guard = f_short_continuation_guard(anchor)
+        float stopBase = lastSwingHigh
+        if not na(guard) and (na(stopBase) or guard < stopBase)
+            stopBase := guard
+        rawStop := stopBase + stopBuffer
+    else
+        rawStop := lowSweepExtreme - stopBuffer
+    float riskPoints = direction == 1 ? anchor - rawStop : rawStop - anchor
+    float rawTarget = useFixedRisk ? (direction == 1 ? anchor + FIXED_TARGET_POINTS : anchor - FIXED_TARGET_POINTS) : isReversal ? (direction == 1 ? asiaHigh : asiaLow) : (direction == 1 ? anchor + riskPoints * continuationRR : anchor - riskPoints * continuationRR)
+    bool validRisk = not na(riskPoints) and riskPoints >= minRisk and riskPoints <= maxRisk
+    bool validTarget = direction == 1 ? rawTarget > anchor : rawTarget < anchor
+    if validRisk and validTarget
+        if pendingDirection != 0
+            f_cancel_pending(pendingDirection)
+        pendingDirection := direction
+        pendingPrice := math.round_to_mintick(anchor)
+        pendingStop := math.round_to_mintick(rawStop)
+        pendingTarget := math.round_to_mintick(rawTarget)
+        pendingRisk := math.round_to_mintick(riskPoints)
+        pendingIsReversal := isReversal
+        pendingExpiresAt := time_close + pendingMinutes * 60 * 1000
+        pendingSignalBar := bar_index
+        pendingOriginSide := setupCode == 1 or setupCode == 2 ? 1 : -1
+        if direction == 1
+            strategy.entry(LONG_ID, strategy.long, limit = pendingPrice, comment = setupCode == 1 ? "High continuation long" : "Low reversal long")
+            if not useFixedRisk
+                strategy.exit(LONG_EXIT_ID, from_entry = LONG_ID, stop = pendingStop, limit = pendingTarget)
+        else
+            strategy.entry(SHORT_ID, strategy.short, limit = pendingPrice, comment = setupCode == 2 ? "High reversal short" : "Low continuation short")
+            if not useFixedRisk
+                strategy.exit(SHORT_EXIT_ID, from_entry = SHORT_ID, stop = pendingStop, limit = pendingTarget)
+
+plot(inMorning and not inRange ? asiaHigh : na, "Asia high 06:00–07:00", color = highColour, linewidth = 2, style = plot.style_linebr)
+plot(inMorning and not inRange ? asiaLow : na, "Asia low 06:00–07:00", color = lowColour, linewidth = 2, style = plot.style_linebr)
+plot(showPending ? (pendingDirection == 1 ? pendingPrice : na) : na, "Pending BUY", color = color.new(longColour, 10), linewidth = 2, style = plot.style_linebr)
+plot(showPending ? (pendingDirection == -1 ? pendingPrice : na) : na, "Pending SELL", color = color.new(shortColour, 10), linewidth = 2, style = plot.style_linebr)
+plot(showRisk ? activeStop : na, "Active stop", color = color.new(color.red, 10), linewidth = 1, style = plot.style_linebr)
+plot(showRisk ? activeTarget : na, "Active target", color = color.new(longColour, 10), linewidth = 1, style = plot.style_linebr)
+
+plotshape(showFilledEntries and newLongPosition, title = "BUY filled", style = shape.labelup, location = location.belowbar, color = longColour, textcolor = color.black, size = size.small, text = "BUY")
+plotshape(showFilledEntries and newShortPosition, title = "SELL filled", style = shape.labeldown, location = location.abovebar, color = shortColour, textcolor = color.white, size = size.small, text = "SELL")
+plotshape(showResearchSteps and highTouchNew, title = "Touched Asia high", style = shape.circle, location = location.abovebar, color = highColour, size = size.tiny)
+plotshape(showResearchSteps and lowTouchNew, title = "Touched Asia low", style = shape.circle, location = location.belowbar, color = lowColour, size = size.tiny)
+plotshape(showResearchSteps and highBosSignal, title = "High continuation BOS", style = shape.labelup, location = location.belowbar, color = longColour, textcolor = color.black, size = size.tiny, text = "BOS")
+plotshape(showResearchSteps and lowBosSignal, title = "Low continuation BOS", style = shape.labeldown, location = location.abovebar, color = shortColour, textcolor = color.white, size = size.tiny, text = "BOS")
+plotshape(showResearchSteps and highChochSignal, title = "High reversal CHoCH", style = shape.labeldown, location = location.abovebar, color = shortColour, textcolor = color.white, size = size.tiny, text = "CH")
+plotshape(showResearchSteps and lowChochSignal, title = "Low reversal CHoCH", style = shape.labelup, location = location.belowbar, color = longColour, textcolor = color.black, size = size.tiny, text = "CH")
+plotshape(showResearchSteps and highRearmBos, title = "High re-arm BOS", style = shape.diamond, location = location.abovebar, color = color.fuchsia, size = size.tiny)
+plotshape(showResearchSteps and lowRearmBos, title = "Low re-arm BOS", style = shape.diamond, location = location.belowbar, color = color.fuchsia, size = size.tiny)
+plotshape(showResearchSteps and highRearmed, title = "High re-armed", style = shape.flag, location = location.abovebar, color = color.fuchsia, size = size.tiny, text = "R")
+plotshape(showResearchSteps and lowRearmed, title = "Low re-armed", style = shape.flag, location = location.belowbar, color = color.fuchsia, size = size.tiny, text = "R")
+
+var label timeframeWarning = na
+if barstate.islast and not (timeframe.isminutes and timeframe.multiplier == 1)
+    if na(timeframeWarning)
+        timeframeWarning := label.new(bar_index, high, "請使用 1 分鐘圖。", style = label.style_label_down, color = color.yellow, textcolor = color.black)
+    else
+        label.set_x(timeframeWarning, bar_index)
+        label.set_y(timeframeWarning, high)
